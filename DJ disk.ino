@@ -1,6 +1,6 @@
 #include <LiquidCrystal.h>
 
-// LCD 接腳：RS, E, D4, D5, D6, D7（LCD Keypad Shield 預設）
+// LCD1602 keypad 接腳：RS, E, D4, D5, D6, D7（LCD Keypad Shield 預設）
 LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
 
 // 馬達控制腳位
