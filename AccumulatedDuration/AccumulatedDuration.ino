@@ -1,5 +1,4 @@
-#include <Wire.h>
-#include <LiquidCrystal.h>
+#include <LiquidCrystal_I2C.h>
 #include <EEPROM.h>
 
 // -------- 編譯選項 --------
@@ -14,25 +13,34 @@
 #endif
 
 // -------------------------
-// LCD1602 keypad 接腳：RS, E, D4, D5, D6, D7（LCD Keypad Shield 預設）
-LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+#define EEPROM_SIZE 1020
+#define BLOCK_SIZE 5
+#define MAX_BLOCKS (EEPROM_SIZE / BLOCK_SIZE)
 
-const int inputPin = 2;
+#define MAGIC_TIME 0xAB
 
-const byte MAGIC = 0xAC;
+#define ZERO_BAR_ADC_VALUE 196
+#define ADC_OFFSET -9
 
-const int TIME1_ADDR = 0;
-const int TIME2_ADDR = 5;
+LiquidCrystal_I2C lcd(0x27,  16, 2); //SDA:A4, SCL:A5
 
-unsigned long highStart = 0;
+unsigned int eepromIndex = 0;  // 動態輪轉位置
+
+const int enablePin = 2;
+
+unsigned long enableLowStart = 0;
+unsigned long resetHighStart = 0;
 unsigned long accumulatedSeconds = 0;
-bool wasHigh = false;
+bool wasLow = false;
 
 const unsigned long SAVE_INTERVAL = 60000;
+const unsigned long RESET_INTERVAL = 10000;
 unsigned long lastSaveMillis = 0;
 
+float pressure = 0;
+
 void setup() {
-  pinMode(inputPin, INPUT);
+  pinMode(enablePin, INPUT);
 
 #if DEBUG_LOG
   Serial.begin(9600);
@@ -40,10 +48,11 @@ void setup() {
   Serial.println("=== Start ===");
 #endif
 
-  lcd.begin(16, 2);
+  lcd.init();
+  lcd.backlight();
 
   // 讀取 EEPROM
-  accumulatedSeconds = loadLastValidRecord(TIME1_ADDR, TIME2_ADDR);
+  accumulatedSeconds = loadLastEEPROMRecord();
 
   displayUpdate(accumulatedSeconds);
 
@@ -52,21 +61,23 @@ void setup() {
 }
 
 void loop() {
-  int state = digitalRead(inputPin);
+  int state = digitalRead(enablePin);
   unsigned long nowMillis = millis();
   unsigned long totalSeconds;
   bool storeData = false;
-
-  // Input 高電位時開始累計
-  if (state == HIGH) {
-    if (!wasHigh) {
-      highStart = nowMillis;
-      wasHigh = true;
-      DEBUG_PRINTLN("HIGH start");
+  
+  // Input 低電位時開始累計
+  if (state == LOW) {
+    if (!wasLow) {
+      enableLowStart = nowMillis;
+      wasLow = true;
+      DEBUG_PRINTLN("LOW start");
     }
 
-    totalSeconds = accumulatedSeconds + (nowMillis - highStart) / 1000;
-    displayUpdate(totalSeconds);
+    if (nowMillis >= enableLowStart)
+      totalSeconds = accumulatedSeconds + (nowMillis - enableLowStart) / 1000;
+    else
+      totalSeconds = accumulatedSeconds + (nowMillis + (0xFFFFFFFF - enableLowStart)) / 1000;
 
     if (nowMillis >= lastSaveMillis) {
       if (nowMillis - lastSaveMillis >= SAVE_INTERVAL)
@@ -77,21 +88,26 @@ void loop() {
         storeData = true;
     }
   } else {
-    if (wasHigh) {
-      accumulatedSeconds += (nowMillis - highStart) / 1000;
-      wasHigh = false;
-      totalSeconds = accumulatedSeconds;
+    if (wasLow) {
+      if (nowMillis >= enableLowStart)
+        accumulatedSeconds += (nowMillis - enableLowStart) / 1000;
+      else
+        accumulatedSeconds += (nowMillis + (0xFFFFFFFF - enableLowStart)) / 1000;
+      wasLow = false;
       storeData = true;
-      DEBUG_PRINT("LOW ");
+      DEBUG_PRINT("High ");
     }
+    totalSeconds = accumulatedSeconds;
   }
 
   if (storeData) {
-    saveRecordWithDoubleBackup(TIME1_ADDR, TIME2_ADDR, totalSeconds);
+    saveEEPROMRecord(totalSeconds);
     lastSaveMillis = nowMillis;
-    DEBUG_PRINT("Saved seconds: ");
-    DEBUG_PRINTLN(totalSeconds);
   }
+
+  readADC();
+  
+  displayUpdate(totalSeconds);
 
   delay(100);
 }
@@ -106,45 +122,79 @@ void displayUpdate(unsigned long seconds) {
   seconds %= 60UL;
 
   snprintf(buf, sizeof(buf), "Time %05u:%02u:%02u",
-           hours, minutes, seconds);
+    hours, minutes, seconds);
 
   lcd.setCursor(0, 0);
   lcd.print(buf);
 
-  DEBUG_PRINT("Display: ");
-  DEBUG_PRINTLN(buf);
+  lcd.setCursor(0, 1);
+
+  memset(buf, ' ', 17);
+  dtostrf(pressure, 5, 1, buf);
+  snprintf(buf + 5, sizeof(buf) - 5, " bar H %s", wasLow ? "Prod" : "Stop");
+  lcd.setCursor(0, 1);
+  lcd.print(buf);
+
+  //DEBUG_PRINT("Display: ");
+  //DEBUG_PRINTLN(buf);
 }
 
 // -------- EEPROM 備援寫入與讀取 --------
-
-void saveRecordWithDoubleBackup(int addr1, int addr2, unsigned long value) {
-  static bool toggle = false;
-  int addr = toggle ? addr1 : addr2;
-  toggle = !toggle;
+void saveEEPROMRecord(unsigned long seconds) {
+  int addr = eepromIndex * BLOCK_SIZE;
 
   for (int i = 0; i < 4; i++)
-    EEPROM.update(addr + i, (value >> (8 * i)) & 0xFF);
+    EEPROM.update(addr + i, (seconds >> (8 * i)) & 0xFF);
+  
+  EEPROM.update(addr + 4, MAGIC_TIME);  // time magic
 
-  EEPROM.update(addr + 4, MAGIC);  // 最後寫 magic byte
+  DEBUG_PRINT("eepromIndex: ");
+  DEBUG_PRINT(eepromIndex);
+  DEBUG_PRINT(" Save time: ");
+  DEBUG_PRINTLN(seconds);
+  eepromIndex = (eepromIndex + 1) % MAX_BLOCKS;
+  
 }
 
-unsigned long readRecord(int addr) {
-  unsigned long value = 0;
+unsigned long loadLastEEPROMRecord() {
+  unsigned int latestIndex = 0;
+  unsigned long oldTime = 0, time;
+  int addr;
 
-  if (EEPROM.read(addr + 4) != MAGIC) return 0;
+  for (unsigned int i = 0; i < MAX_BLOCKS; i++) {
+    addr = i * BLOCK_SIZE;
+    
+    if (EEPROM.read(addr + 4) == MAGIC_TIME) {
+      time = 0;
+      for (int j = 0; j < 4; j++)
+        time |= ((unsigned long)EEPROM.read(addr + j)) << (8 * j);
+      
+      if (time >= oldTime) {
+        oldTime = time;
+        latestIndex = i;
+      }
+    }
+  }
 
-  for (int i = 0; i < 4; i++)
-    value |= ((unsigned long)EEPROM.read(addr + i)) << (8 * i);
+  DEBUG_PRINT("Load latestIndex: ");
+  DEBUG_PRINT(latestIndex);
+  DEBUG_PRINT(" time: ");
+  DEBUG_PRINTLN(oldTime);
 
-  return value;
+  eepromIndex = (latestIndex + 1) % MAX_BLOCKS;
+  
+  return oldTime;
 }
 
-unsigned long loadLastValidRecord(int addr1, int addr2) {
-  unsigned long v1 = readRecord(addr1);
-  unsigned long v2 = readRecord(addr2);
-  DEBUG_PRINT("EEPROM A: ");
-  DEBUG_PRINTLN(v1);
-  DEBUG_PRINT("EEPROM B: ");
-  DEBUG_PRINTLN(v2);
-  return max(v1, v2);
+void readADC() {
+  int adcValue = analogRead(A0) - ZERO_BAR_ADC_VALUE + ADC_OFFSET;
+  float newPressure;
+  newPressure = adcValue / 56.975467;
+  //DEBUG_PRINT("adcValue: ");
+  //DEBUG_PRINTLN(adcValue);
+  if (pressure != newPressure) {
+    pressure = newPressure;
+    if (pressure < 0)
+      pressure = 0;
+  }
 }
