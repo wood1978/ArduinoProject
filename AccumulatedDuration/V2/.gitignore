@@ -1,1 +1,7 @@
 AccumulatedDuration_V2-backups/
+Gerber/
+fp-info-cache
+fp-lib-table
+freerouting.dsn
+sym-lib-table
+temp-freerouting.dsn
