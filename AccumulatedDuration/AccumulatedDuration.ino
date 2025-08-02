@@ -41,8 +41,8 @@ unsigned long resetHighStart = 0;
 unsigned long accumulatedSeconds = 0;
 
 unsigned int eepromIndex = 0; //Loop all EEPROM by index
-unsigned int alarm2Enable = 0;
-
+bool alarm1Enable = false;
+bool alarm2Enable = false;
 bool pressureLow = false;
 bool produceEnable = false;
 
@@ -125,15 +125,7 @@ void displayUpdate(unsigned long seconds) {
   lcd.print(buf);
   
   dtostrf(pressure, 5, 2, buf);
-  if (alarm2Enable > 0) {
-    if (alarm2Enable < 2)
-      alarm2Enable++;
-    else
-      alarm2Enable = 1;
-    snprintf(buf + 5, sizeof(buf) - 5, " bar %s", (alarm2Enable % 2) ? "! ALARM2 !" : " !ALARM2! ");
-  }
-  else
-    snprintf(buf + 5, sizeof(buf) - 5, " bar           ");
+  snprintf(buf + 5, sizeof(buf) - 5, " bar");
   lcd.setCursor(0, 2);
   lcd.print(buf);
 
@@ -196,7 +188,7 @@ void saveEEPROMRecord(unsigned long seconds) {
   eepromIndex = (eepromIndex + 1) % MAX_BLOCKS;
 }
 
-bool readPressure() {
+void readPressure() {
   uint8_t result;
   uint16_t buffer;
   float newPressure;
@@ -236,35 +228,33 @@ bool readPressure() {
     buffer = node.getResponseBuffer(0);
     //DEBUG_PRINT("0x0005: ");
     //DEBUG_PRINTLN(buffer);
-    if (buffer & 0x02) {
-      if (alarm2Enable == 0)
-        alarm2Enable = 1;
-    }
-    else
-      alarm2Enable = 0;
 
     if (buffer & 0x01)
-      return true;
-  }
+      alarm1Enable = true;
+    else
+      alarm1Enable = false;
 
-  return false;
+    if (buffer & 0x02)
+      alarm2Enable = true;
+    else
+      alarm2Enable = false;
+  }
 }
 
 void loop() {
   unsigned long nowMillis;
   unsigned long totalSeconds;
-  int state;
   bool storeData = false;
 
-  state = readPressure();
+  readPressure();
   nowMillis = millis();
-  if (state == HIGH) {
+  if (alarm1Enable == true) {
     if (!pressureLow) {
       enableLowStart = nowMillis;
       pressureLow = true;
       produceEnable = true;
       digitalWrite(RELAY_CONTROL_PIN, LOW);
-      DEBUG_PRINTLN("LOW start");
+      DEBUG_PRINTLN("Pressure low start");
     }
 
     if (nowMillis >= enableLowStart)
@@ -281,18 +271,20 @@ void loop() {
         storeData = true;
     }
   } else {
-    if (pressureLow) {
-      if (nowMillis >= enableLowStart)
-        accumulatedSeconds += (nowMillis - enableLowStart) / 1000;
-      else
-        accumulatedSeconds += (nowMillis + (0xFFFFFFFF - enableLowStart)) / 1000;
-      pressureLow = false;
-      storeData = true;
-      produceEnable = false;
-      digitalWrite(RELAY_CONTROL_PIN, HIGH);
-      DEBUG_PRINT("High ");
+    if (alarm2Enable == true) {
+      if (pressureLow) {
+        if (nowMillis >= enableLowStart)
+          accumulatedSeconds += (nowMillis - enableLowStart) / 1000;
+        else
+          accumulatedSeconds += (nowMillis + (0xFFFFFFFF - enableLowStart)) / 1000;
+        pressureLow = false;
+        storeData = true;
+        produceEnable = false;
+        digitalWrite(RELAY_CONTROL_PIN, HIGH);
+        DEBUG_PRINT("Pressure high stop");
+      }
+      totalSeconds = accumulatedSeconds;
     }
-    totalSeconds = accumulatedSeconds;
   }
 
   if (storeData) {
